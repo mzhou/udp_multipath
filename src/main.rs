@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use clap::{App, Arg};
+use socket2;
 use tokio::net::UdpSocket;
 
 const LOCAL_BIND: &str = "LOCAL_BIND";
@@ -504,6 +505,15 @@ async fn group_recv_loop(
     Ok(())
 }
 
+async fn ds_bind(addr: SocketAddr) -> io::Result<UdpSocket> {
+    let s2 = socket2::Socket::new(socket2::Domain::ipv6(), socket2::Type::dgram(), None)?;
+    s2.set_only_v6(false)?;
+    s2.set_nonblocking(true)?;
+    s2.bind(&socket2::SockAddr::from(addr))?;
+    let s_std: std::net::UdpSocket = s2.into_udp_socket();
+    UdpSocket::from_std(s_std)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), MainError> {
     let matches = App::new("udp_multipath")
@@ -567,11 +577,7 @@ async fn main() -> Result<(), MainError> {
             .await
             .map_err(MainError::LocalBind)?,
     );
-    let remote_sock = Arc::new(
-        UdpSocket::bind(remote_bind)
-            .await
-            .map_err(MainError::RemoteBind)?,
-    );
+    let remote_sock = Arc::new(ds_bind(remote_bind).await.map_err(MainError::RemoteBind)?);
 
     let local_recv_loop_config = LocalRecvLoopConfig {
         initial_remote_addrs: remote_connect,

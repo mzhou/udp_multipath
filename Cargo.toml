@@ -8,4 +8,5 @@ edition = "2018"
 
 [dependencies]
 clap = "2.33"
+socket2 = "0.3"
 tokio = { version = "0.3", features = ["full"] }
