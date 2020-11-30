@@ -183,8 +183,7 @@ impl State {
                     is_new_remote: found_by_content,
                     local_bind: group_read.local_bind,
                     local_sock: group_read.local_sock.clone(),
-                    old_leader: if !found_by_content && !is_dup && group_read.leader != Some(*addr)
-                    {
+                    old_leader: if !is_dup && group_read.leader != Some(*addr) {
                         group_read.leader
                     } else {
                         None
@@ -214,6 +213,7 @@ impl State {
             Some(group) => {
                 let mut group_write = group.write().unwrap();
                 if !is_dup {
+                    //eprintln!("set leader to {}", *addr);
                     group_write.leader = Some(*addr);
                     if group_write.recent_recv.len() >= recent_recv_limit {
                         let deleted = group_write.recent_recv.pop_front();
@@ -226,6 +226,8 @@ impl State {
                     group_write.recent_recv.push_back(packet);
                     group_write.recent_recv_set.insert(packet);
                     self.packet_map.insert(packet, group.clone());
+                } else {
+                    //eprintln!("is_dup");
                 }
                 if is_new_remote {
                     group_write.remotes.push(Remote {
@@ -241,7 +243,9 @@ impl State {
                     }
                 }
             }
-            _ => {}
+            _ => {
+                eprintln!("remote_update group not found");
+            }
         }
     }
 
@@ -410,22 +414,15 @@ async fn remote_recv_loop(
                 if let Some(old_leader) = old_leader {
                     println!("NewLeader,{},{},{}", local_bind, addr, old_leader);
                 }
-                // update in background
                 if !updated {
-                    tokio::spawn({
-                        let state = state.clone();
-                        async move {
-                            //eprintln!("background update");
-                            state.write().unwrap().remote_update(
-                                64,
-                                &addr,
-                                data_hash,
-                                is_dup,
-                                is_new_remote,
-                                now,
-                            )
-                        }
-                    });
+                    state.write().unwrap().remote_update(
+                        64,
+                        &addr,
+                        data_hash,
+                        is_dup,
+                        is_new_remote,
+                        now,
+                    );
                 }
             }
             _ => {}
