@@ -1,17 +1,18 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::hash::Hasher;
 use std::io;
+use std::iter::FromIterator;
 use std::net::{AddrParseError, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use clap::{App, Arg};
 use tokio::net::UdpSocket;
-use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 const LOCAL_BIND: &str = "LOCAL_BIND";
 const LOCAL_CONNECT: &str = "LOCAL_CONNECT";
@@ -29,24 +30,38 @@ enum MainError {
     LocalRecvLoop(io::Error),
     RemoteBind(io::Error),
     RemoteConnect(io::Error),
+    RemoteRecvLoop(io::Error),
     TaskJoin(tokio::task::JoinError),
 }
 
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct Packet {
-    src_hash: u64,
     content_hash: u64,
-    time: Instant,
+}
+
+struct Remote {
+    addr: SocketAddr,
+    last_recv_time: Instant,
 }
 
 struct Group {
     local_sock: Arc<UdpSocket>,
     recent_recv: VecDeque<Packet>,
-    remote_addrs: Vec<SocketAddr>,
+    recent_recv_set: HashSet<Packet>,
+    remotes: Vec<Remote>,
+}
+
+enum RemoteTryResult {
+    Found(Arc<UdpSocket>, bool), // local_sock, is_dup
+    NotFound,
 }
 
 struct State {
-    initial_group: Option<Group>,
-    groups: Vec<Group>,
+    addr_map: HashMap<SocketAddr, Arc<RwLock<Group>>>,
+    groups: Vec<Arc<RwLock<Group>>>,
+    initial_group: Option<Arc<RwLock<Group>>>,
+    local_connect: Option<SocketAddr>,
+    packet_map: HashMap<Packet, Arc<RwLock<Group>>>,
 }
 
 impl fmt::Display for MainError {
@@ -65,6 +80,7 @@ impl fmt::Display for MainError {
                 LocalRecvLoop(e) => format!("local recv loop: {}", e),
                 RemoteBind(e) => format!("bind remote socket: {}", e),
                 RemoteConnect(e) => format!("connect remote socket: {}", e),
+                RemoteRecvLoop(e) => format!("remote recv loop: {}", e),
                 TaskJoin(e) => format!("task join: {}", e),
             }
         )
@@ -72,28 +88,133 @@ impl fmt::Display for MainError {
 }
 
 impl State {
-    fn local_inital_set<'a>(
+    fn local_connect_set(self: &mut Self, addr: SocketAddr) {
+        self.local_connect = Some(addr)
+    }
+
+    fn local_inital_set(
         self: &mut Self,
         local_sock: Arc<UdpSocket>,
-        remote_addrs: Vec<SocketAddr>,
+        remote_addrs: &[SocketAddr],
+        now: Instant,
     ) {
-        eprintln!("local_initial_set");
-        self.initial_group = Some(Group {
+        let group = Arc::new(RwLock::new(Group {
             local_sock,
-            recent_recv: VecDeque::<Packet>::new(),
-            remote_addrs,
-        });
+            recent_recv: VecDeque::new(),
+            recent_recv_set: HashSet::new(),
+            remotes: remote_addrs
+                .iter()
+                .map(|a| Remote {
+                    addr: *a,
+                    last_recv_time: now,
+                })
+                .collect(),
+        }));
+        self.initial_group = Some(group.clone());
+        for addr in remote_addrs.iter() {
+            self.addr_map.insert(*addr, group.clone());
+        }
     }
 
     fn local_initial_try(self: &Self) -> Option<Vec<SocketAddr>> {
-        eprintln!("local_initial_try");
-        Some(self.initial_group.as_ref()?.remote_addrs.clone())
+        Some(
+            self.initial_group
+                .as_ref()?
+                .read()
+                .unwrap()
+                .remotes
+                .iter()
+                .map(|r| r.addr)
+                .collect(),
+        )
+    }
+
+    fn remote_new_group(
+        self: &mut Self,
+        addr: SocketAddr,
+        content_hash: u64,
+        now: Instant,
+        local_sock: Arc<UdpSocket>,
+    ) -> RemoteTryResult {
+        use RemoteTryResult::*;
+        let mut group = Group {
+            local_sock: local_sock.clone(),
+            recent_recv: VecDeque::new(),
+            recent_recv_set: HashSet::new(),
+            remotes: Vec::new(),
+        };
+        let packet = Packet { content_hash };
+        group.recent_recv.push_back(packet);
+        group.recent_recv_set.insert(packet);
+        group.remotes.push(Remote {
+            addr,
+            last_recv_time: now,
+        });
+        self.addr_map.insert(addr, Arc::new(RwLock::new(group)));
+        Found(local_sock, false)
+    }
+
+    fn remote_try(self: &Self, addr: &SocketAddr, content_hash: u64) -> RemoteTryResult {
+        use RemoteTryResult::*;
+        match self
+            .addr_map
+            .get(addr)
+            .or_else(|| self.packet_map.get(&Packet { content_hash }))
+            .as_ref()
+        {
+            Some(group) => {
+                let group_read = group.read().unwrap();
+                Found(
+                    group_read.local_sock.clone(),
+                    group_read.recent_recv.contains(&Packet { content_hash }),
+                )
+            }
+            _ => NotFound,
+        }
+    }
+
+    fn remote_update(
+        self: &mut Self,
+        recent_recv_limit: usize,
+        addr: &SocketAddr,
+        content_hash: u64,
+        is_dup: bool,
+        now: Instant,
+    ) {
+        match self.addr_map.get_mut(addr).as_mut() {
+            Some(group) => {
+                let mut group_write = group.write().unwrap();
+                if !is_dup {
+                    if group_write.recent_recv.len() >= recent_recv_limit {
+                        let deleted = group_write.recent_recv.pop_front();
+                        if let Some(deleted) = deleted {
+                            group_write.recent_recv_set.remove(&deleted);
+                            self.packet_map.remove(&deleted);
+                        }
+                    }
+                    let packet = Packet { content_hash };
+                    group_write.recent_recv.push_back(packet);
+                    group_write.recent_recv_set.insert(packet);
+                    self.packet_map.insert(packet, group.clone());
+                }
+                for remote in group_write.remotes.iter_mut() {
+                    if remote.addr == *addr {
+                        remote.last_recv_time = now;
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn new() -> Self {
         State {
+            addr_map: HashMap::new(),
             initial_group: None,
             groups: Vec::new(),
+            local_connect: None,
+            packet_map: HashMap::new(),
         }
     }
 }
@@ -113,11 +234,12 @@ struct LocalRecvLoopConfig {
 
 async fn local_recv_loop(
     c: LocalRecvLoopConfig,
-    state: RwLock<State>,
+    state: Arc<RwLock<State>>,
 ) -> Result<(), tokio::io::Error> {
     let mut local_connected = match c.local_connect {
         Some(addr) => {
             c.local_sock.connect(addr).await?;
+            state.write().unwrap().local_connect_set(addr);
             Some(addr)
         }
         _ => None,
@@ -126,6 +248,7 @@ async fn local_recv_loop(
     loop {
         let mut buf = [0u8; 16 * 1024];
         let (len, addr) = c.local_sock.recv_from(&mut buf).await?;
+        let now = Instant::now();
         eprintln!("local_recv_loop got datagram {} {}", len, addr);
         let data = &buf[..len];
         let data_hash = hash_bytes(data);
@@ -135,21 +258,25 @@ async fn local_recv_loop(
             eprintln!("local_recv_loop reconnect local socket");
             c.local_sock.connect(addr).await?;
             eprintln!("local_recv_loop reconnected local socket");
+            state.write().unwrap().local_connect_set(addr);
             local_connected = Some(addr);
         }
 
         // create group for initial remote if necessary
         eprintln!("local_recv_loop acquire state read");
-        let remote_addrs_tried = state.read().await.local_initial_try();
+        // readguard isn't released if used directly in match
+        // https://doc.rust-lang.org/stable/reference/destructors.html#temporary-scopes
+        let remote_addrs_tried = state.read().unwrap().local_initial_try();
         eprintln!("local_recv_loop released state read");
         let remote_addrs = match remote_addrs_tried {
             Some(r) => r,
             _ => {
                 eprintln!("local_recv_loop acquire state write");
-                state
-                    .write()
-                    .await
-                    .local_inital_set(c.local_sock.clone(), c.initial_remote_addrs.clone());
+                state.write().unwrap().local_inital_set(
+                    c.local_sock.clone(),
+                    &c.initial_remote_addrs,
+                    now,
+                );
                 eprintln!("local_recv_loop released state write");
                 c.initial_remote_addrs.clone()
             }
@@ -161,6 +288,67 @@ async fn local_recv_loop(
             if let Err(e) = c.remote_sock.send_to(data, remote_addr).await {
                 eprintln!("local_recv_loop send_to {} {}", remote_addr, e);
             }
+        }
+    }
+}
+
+struct RemoteRecvLoopConfig {
+    local_bind: SocketAddr,
+    remote_sock: Arc<UdpSocket>,
+}
+
+async fn remote_recv_loop(
+    c: RemoteRecvLoopConfig,
+    state: Arc<RwLock<State>>,
+) -> Result<(), tokio::io::Error> {
+    use RemoteTryResult::*;
+    loop {
+        let mut buf = [0u8; 16 * 1024];
+        let (len, addr) = c.remote_sock.recv_from(&mut buf).await?;
+        let now = Instant::now();
+        eprintln!("remote_recv_loop got datagram {} {}", len, addr);
+        let data = &buf[..len];
+        let data_hash = hash_bytes(data);
+
+        // see if this remote address is already in a group
+        let mut local_sock = state.read().unwrap().remote_try(&addr, data_hash);
+        let mut updated = false;
+        match local_sock {
+            NotFound => {
+                // need to create group
+                let local_addr = state.read().unwrap().local_connect;
+                if let Some(local_addr) = local_addr {
+                    let new_sock = Arc::new(UdpSocket::bind(c.local_bind).await?);
+                    new_sock.connect(local_addr).await?;
+                    local_sock = state
+                        .write()
+                        .unwrap()
+                        .remote_new_group(addr, data_hash, now, new_sock);
+                    updated = true;
+                }
+            }
+            _ => {}
+        }
+
+        // TODO: drop packet if duplicate
+
+        match local_sock {
+            Found(local_sock, is_dup) => {
+                local_sock.send(data).await?;
+                // update in background
+                if !updated {
+                    tokio::spawn({
+                        let state = state.clone();
+                        async move {
+                            state
+                                .write()
+                                .unwrap()
+                                .remote_update(64, &addr, data_hash, is_dup, now)
+                        }
+                    });
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -241,11 +429,22 @@ async fn main() -> Result<(), MainError> {
         remote_sock: remote_sock.clone(),
     };
 
-    let state = RwLock::new(State::new());
+    let remote_recv_loop_config = RemoteRecvLoopConfig {
+        local_bind,
+        remote_sock: remote_sock.clone(),
+    };
 
-    let local_recv_loop_task = tokio::spawn(local_recv_loop(local_recv_loop_config, state));
+    let state = Arc::new(RwLock::new(State::new()));
+
+    let local_recv_loop_task = tokio::spawn(local_recv_loop(local_recv_loop_config, state.clone()));
+    let remote_recv_loop_tast =
+        tokio::spawn(remote_recv_loop(remote_recv_loop_config, state.clone()));
 
     eprintln!("main await");
+    remote_recv_loop_tast
+        .await
+        .map_err(MainError::TaskJoin)?
+        .map_err(MainError::RemoteRecvLoop)?;
     local_recv_loop_task
         .await
         .map_err(MainError::TaskJoin)?
