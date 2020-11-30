@@ -201,7 +201,6 @@ impl State {
         addr: &SocketAddr,
         content_hash: u64,
         is_dup: bool,
-        is_new_leader: bool,
         is_new_remote: bool,
         now: Instant,
     ) {
@@ -215,6 +214,7 @@ impl State {
             Some(group) => {
                 let mut group_write = group.write().unwrap();
                 if !is_dup {
+                    group_write.leader = Some(*addr);
                     if group_write.recent_recv.len() >= recent_recv_limit {
                         let deleted = group_write.recent_recv.pop_front();
                         if let Some(deleted) = deleted {
@@ -233,9 +233,6 @@ impl State {
                         last_recv_time: now,
                     });
                     self.addr_map.insert(*addr, group.clone());
-                }
-                if is_new_leader {
-                    group_write.leader = Some(*addr);
                 }
                 for remote in group_write.remotes.iter_mut() {
                     if remote.addr == *addr {
@@ -424,7 +421,6 @@ async fn remote_recv_loop(
                                 &addr,
                                 data_hash,
                                 is_dup,
-                                old_leader != None,
                                 is_new_remote,
                                 now,
                             )
