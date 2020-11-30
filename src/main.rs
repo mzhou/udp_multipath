@@ -93,7 +93,7 @@ impl State {
         self.local_connect = Some(addr)
     }
 
-    fn local_inital_set(
+    fn local_initial_set(
         self: &mut Self,
         local_bind: SocketAddr,
         local_sock: Arc<UdpSocket>,
@@ -201,6 +201,7 @@ impl State {
         addr: &SocketAddr,
         content_hash: u64,
         is_dup: bool,
+        is_new_leader: bool,
         is_new_remote: bool,
         now: Instant,
     ) {
@@ -232,6 +233,9 @@ impl State {
                         last_recv_time: now,
                     });
                     self.addr_map.insert(*addr, group.clone());
+                }
+                if is_new_leader {
+                    group_write.leader = Some(*addr);
                 }
                 for remote in group_write.remotes.iter_mut() {
                     if remote.addr == *addr {
@@ -279,6 +283,7 @@ async fn local_recv_loop(
         }
         _ => None,
     };
+    let local_bind = c.local_sock.local_addr()?;
 
     loop {
         let mut buf = [0u8; 16 * 1024];
@@ -289,7 +294,7 @@ async fn local_recv_loop(
 
         // reconnect local socket if necessary
         if Some(addr) != local_connected {
-            //eprintln!("local_recv_loop reconnect local socket");
+            //eprintln!("local_recv_loop reconnect local socket {}", addr);
             c.local_sock.connect(addr).await?;
             //eprintln!("local_recv_loop reconnected local socket");
             state.write().unwrap().local_connect_set(addr);
@@ -306,7 +311,7 @@ async fn local_recv_loop(
             Some(r) => r,
             _ => {
                 //eprintln!("local_recv_loop acquire state write");
-                state.write().unwrap().local_inital_set(
+                state.write().unwrap().local_initial_set(
                     c.local_sock.local_addr()?,
                     c.local_sock.clone(),
                     &c.initial_remote_addrs,
@@ -321,7 +326,7 @@ async fn local_recv_loop(
         // forward the packet
         for remote_addr in remote_addrs.iter() {
             if let Err(e) = c.remote_sock.send_to(data, remote_addr).await {
-                println!("");
+                println!("RemoteSendToErr,{},{},{}", local_bind, remote_addr, e);
                 //eprintln!("local_recv_loop send_to {} {}", remote_addr, e);
             }
         }
@@ -419,6 +424,7 @@ async fn remote_recv_loop(
                                 &addr,
                                 data_hash,
                                 is_dup,
+                                old_leader != None,
                                 is_new_remote,
                                 now,
                             )
@@ -444,18 +450,20 @@ async fn group_recv_loop(
     let local_bind = group.read().unwrap().local_bind;
     let local_sock = group.read().unwrap().local_sock.clone();
 
+    //eprintln!("group_recv_loop spawned for {}", local_bind);
+
     loop {
         let mut buf = [0u8; 16 * 1024];
         let (len, addr) = local_sock.recv_from(&mut buf).await?;
         let now = Instant::now();
-        eprintln!("group_recv_loop got datagram {} {}", len, addr);
+        //eprintln!("group_recv_loop got datagram {} {}", len, addr);
         let data = &buf[..len];
 
         let mut need_cleanup = false;
 
         let mut errored_remote_addrs = Vec::<SocketAddr>::new();
         let remotes = group.read().unwrap().remotes.clone();
-        eprintln!("group_recv_loop forwarding to {} remotes", remotes.len());
+        //eprintln!("group_recv_loop forwarding to {} remotes", remotes.len());
         for remote in remotes.iter() {
             if now - remote.last_recv_time >= c.remote_idle_expiry {
                 need_cleanup = true;
