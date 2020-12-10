@@ -217,10 +217,19 @@ impl WarmState {
             self.addr_map.insert(*addr, group.clone());
             if is_first {
                 self.hot_state_ltr.write().unwrap().add(addr);
-                self.hot_state_rtl.write().unwrap().add(addr, local_sock.clone());
+                self.hot_state_rtl
+                    .write()
+                    .unwrap()
+                    .add(addr, local_sock.clone());
             } else {
-                self.hot_state_ltr.write().unwrap().alias(addr, &remote_addrs[0]);
-                self.hot_state_rtl.write().unwrap().alias(addr, &remote_addrs[0]);
+                self.hot_state_ltr
+                    .write()
+                    .unwrap()
+                    .alias(addr, &remote_addrs[0]);
+                self.hot_state_rtl
+                    .write()
+                    .unwrap()
+                    .alias(addr, &remote_addrs[0]);
             }
             is_first = false;
         }

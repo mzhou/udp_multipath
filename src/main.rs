@@ -179,15 +179,23 @@ fn warm_loop(mut config: WarmLoopConfig) -> Result<(), Box<dyn std::error::Error
         use WarmReq::*;
         match req_enum {
             FreshPacket(req) => {
-                config.state.handle_known_packet(&req.now, &req.remote_addr, req.content_hash);
-            },
+                config
+                    .state
+                    .handle_known_packet(&req.now, &req.remote_addr, req.content_hash);
+            }
             UnknownSource(req) => {
-                let warm_config = state::WarmConfig{
+                let warm_config = state::WarmConfig {
                     match_window: Duration::from_secs(10),
                 };
                 let local_sock_f = || Arc::new(ds_bind(SA_ANY).unwrap());
-                config.state.handle_new_remote(&warm_config, local_sock_f, &req.now, &req.remote_addr, req.content_hash);
-            },
+                config.state.handle_new_remote(
+                    &warm_config,
+                    local_sock_f,
+                    &req.now,
+                    &req.remote_addr,
+                    req.content_hash,
+                );
+            }
         }
     }
 }
@@ -326,7 +334,8 @@ fn main() -> Result<(), MainError> {
             queue: warm_queue_receiver,
             state,
         };
-        warm_loop(config);
+        let warm_loop_result = warm_loop(config);
+        eprintln!("warm_loop_result {:?}", warm_loop_result);
     }
 
     let remote_recv_loop_result = remote_recv_loop_thread.join();
