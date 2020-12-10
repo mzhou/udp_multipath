@@ -242,7 +242,7 @@ impl WarmState {
         }
     }
 
-    pub fn dump_groupus(&self) -> String {
+    pub fn dump_groups(&self, now: &Instant) -> String {
         let mut seen_local_names = HashSet::<String>::new();
         self.addr_map
             .iter()
@@ -255,7 +255,17 @@ impl WarmState {
                     let remotes_str = entry
                         .remotes
                         .iter()
-                        .map(|r| r.addr.to_string())
+                        .map(|r| {
+                            format!(
+                                "{}={}",
+                                r.addr.to_string(),
+                                match r.last_recv_time {
+                                    None => -1,
+                                    Some(last_recv_time) =>
+                                        (*now - last_recv_time).as_millis() as i32,
+                                }
+                            )
+                        })
                         .collect::<Vec<String>>()
                         .join(",");
                     Some(format!("{} {}", name, remotes_str))
@@ -311,31 +321,54 @@ impl WarmState {
                     }
                     None => {
                         // otherwise look for pending remote
-                        let pending_entry = self.pending_addr_map.entry(*addr);
+                        let Self {
+                            ref mut pending_addr_map,
+                            ref pending_packet_map,
+                            ..
+                        } = self;
+                        let pending_entry = pending_addr_map.entry(*addr);
                         match pending_entry {
                             Entry::Occupied(o) => {
                                 // check if enough time passed without a match
                                 let first_recv_time = o.get().borrow().first_recv_time;
                                 if *now - first_recv_time > config.match_window {
+                                    // gather all remotes with relevant packet hashes
+                                    let addrs = Self::get_pending_addrs_by_packets(
+                                        pending_packet_map,
+                                        &o.get().borrow().seen_packets[..],
+                                    );
+                                    let first_addr = addrs[0];
                                     // create new group
                                     let local_info = local_info_f();
                                     self.addr_map.insert(
-                                        *addr,
+                                        first_addr,
                                         Rc::new(RefCell::new(WarmGroup {
                                             last_recv_time: Some(*now),
                                             name: local_info.name,
-                                            remotes: vec![WarmRemote {
-                                                addr: *addr,
-                                                last_recv_time: Some(*now),
-                                            }],
+                                            remotes: addrs
+                                                .iter()
+                                                .map(|addr| WarmRemote {
+                                                    addr: *addr,
+                                                    last_recv_time: Some(*now),
+                                                })
+                                                .collect(),
                                         })),
                                     );
-                                    self.hot_state_ltr.write().unwrap().add(addr);
-                                    self.hot_state_rtl
-                                        .write()
-                                        .unwrap()
-                                        .add(addr, local_info.sock);
-                                    self.cleanup_pending_remote(addr);
+                                    {
+                                        let mut hot_state_ltr = self.hot_state_ltr.write().unwrap();
+                                        hot_state_ltr.add(&first_addr);
+                                        addrs[1..]
+                                            .iter()
+                                            .for_each(|a| hot_state_ltr.alias(a, &first_addr));
+                                    }
+                                    {
+                                        let mut hot_state_rtl = self.hot_state_rtl.write().unwrap();
+                                        hot_state_rtl.add(addr, local_info.sock);
+                                        addrs[1..]
+                                            .iter()
+                                            .for_each(|a| hot_state_rtl.alias(a, &first_addr));
+                                    }
+                                    self.cleanup_pending_remote(&first_addr);
                                 } else {
                                     // register pending packet
                                     o.get()
@@ -356,6 +389,7 @@ impl WarmState {
                                     .entry(Packet { content_hash })
                                     .or_default()
                                     .push(pending_value.clone());
+                                eprintln!("handle_new_remote made pending entry {} {} packet remotes len {}", *addr, content_hash, self.pending_packet_map.get(&Packet{ content_hash}).unwrap().len());
                             }
                         }
                     }
@@ -380,24 +414,32 @@ impl WarmState {
             // update and expire remotes
             let mut expired_addrs = Vec::<SocketAddr>::new();
             assert!(!group.remotes.is_empty());
+            let name = group.name.clone();
+            // true means remove, false means keep
             group.remotes.drain_filter(|r| {
                 match r.last_recv_time {
                     None => {
                         // do nothing, not even update static remotes
-                        true
+                        false
                     }
                     Some(old_last_recv_time) => {
                         // update if this is the one in question
                         if r.addr == *addr {
                             r.last_recv_time = Some(*now);
-                            true
-                        } else if *now > old_last_recv_time + config.expiry { // otherwise expire
+                            false
+                        } else if *now > old_last_recv_time + config.expiry {
+                            // otherwise expire
+                            eprintln!(
+                                "handle_known_packet expiring {} from {}",
+                                r.addr.to_string(),
+                                name
+                            );
                             // note to update hot state
                             expired_addrs.push(r.addr);
-                            false
+                            true
                         } else {
                             // otherwise keep
-                            true
+                            false
                         }
                     }
                 }
@@ -459,5 +501,18 @@ impl WarmState {
                 self.pending_packet_map.remove(packet);
             }
         }
+    }
+
+    fn get_pending_addrs_by_packets(
+        pending_packet_map: &HashMap<Packet, Vec<WarmPendingRemoteRef>>,
+        packets: &[Packet],
+    ) -> Vec<SocketAddr> {
+        packets
+            .iter()
+            .filter_map(|p| Some(pending_packet_map.get(p)?.iter().map(|r| r.borrow().addr)))
+            .flatten()
+            .collect::<HashSet<SocketAddr>>()
+            .into_iter()
+            .collect()
     }
 }

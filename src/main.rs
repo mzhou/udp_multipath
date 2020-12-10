@@ -165,6 +165,7 @@ fn remote_recv_loop(
 }
 
 struct WarmLoopConfig {
+    local_connect: Option<SocketAddr>,
     queue: Receiver<WarmReq>,
     state: state::WarmState,
 }
@@ -192,18 +193,21 @@ fn warm_loop(mut config: WarmLoopConfig) -> Result<(), Box<dyn std::error::Error
                         );
                     }
                     UnknownSource(req) => {
-                        let local_info_f = || {
-                            let sock = Arc::new(ds_bind(sa_any).unwrap());
-                            let name = sock.local_addr().unwrap().to_string();
-                            state::LocalInfo { name, sock }
-                        };
-                        config.state.handle_new_remote(
-                            &warm_config,
-                            local_info_f,
-                            &req.now,
-                            &req.remote_addr,
-                            req.content_hash,
-                        );
+                        if let Some(local_connect) = config.local_connect {
+                            let local_info_f = || {
+                                let sock = Arc::new(ds_bind(sa_any).unwrap());
+                                sock.connect(local_connect).unwrap();
+                                let name = sock.local_addr().unwrap().to_string();
+                                state::LocalInfo { name, sock }
+                            };
+                            config.state.handle_new_remote(
+                                &warm_config,
+                                local_info_f,
+                                &req.now,
+                                &req.remote_addr,
+                                req.content_hash,
+                            );
+                        }
                     }
                 }
             }
@@ -215,7 +219,7 @@ fn warm_loop(mut config: WarmLoopConfig) -> Result<(), Box<dyn std::error::Error
         if now - last_dump_time > Duration::from_secs(5) {
             println!(
                 "=begin warm state\n{}\n=end warm state",
-                config.state.dump_groupus()
+                config.state.dump_groups(&now)
             );
             last_dump_time = now;
         }
@@ -354,6 +358,7 @@ fn main() -> Result<(), MainError> {
     // run background task on main thread
     {
         let config = WarmLoopConfig {
+            local_connect,
             queue: warm_queue_receiver,
             state,
         };
