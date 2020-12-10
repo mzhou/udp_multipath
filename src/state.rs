@@ -294,122 +294,6 @@ impl WarmState {
         self.hot_state_rtl.clone()
     }
 
-    pub fn handle_new_remote<F>(
-        self: &mut Self,
-        config: &WarmConfig,
-        local_info_f: F,
-        now: &Instant,
-        addr: &SocketAddr,
-        content_hash: u64,
-    ) where
-        F: FnOnce() -> LocalInfo,
-    {
-        let existing_group = self.addr_map.get(addr);
-        match existing_group {
-            Some(_) => {
-                // do nothing if already added, other than ensure pending is clean
-                self.cleanup_pending_remote(addr);
-            }
-            None => {
-                // otherwise look for matching packet
-                let matching_group = self.packet_map.get(&Packet { content_hash });
-                match matching_group {
-                    Some(g) => {
-                        {
-                            let mut g_mut = g.borrow_mut();
-                            // add to existing group
-                            g_mut.remotes.push(WarmRemote {
-                                addr: *addr,
-                                last_recv_time: Some(*now),
-                            });
-                            self.addr_map.insert(*addr, g.clone());
-                            self.hot_state_ltr
-                                .write()
-                                .unwrap()
-                                .alias(addr, &g_mut.remotes[0].addr); // we will never have an empty group
-                        }
-                        self.cleanup_pending_remote(addr);
-                    }
-                    None => {
-                        // otherwise look for pending remote
-                        let Self {
-                            ref mut pending_addr_map,
-                            ref pending_packet_map,
-                            ..
-                        } = self;
-                        let pending_entry = pending_addr_map.entry(*addr);
-                        match pending_entry {
-                            Entry::Occupied(o) => {
-                                // check if enough time passed without a match
-                                let first_recv_time = o.get().borrow().first_recv_time;
-                                if *now - first_recv_time > config.match_window {
-                                    // gather all remotes with relevant packet hashes
-                                    let addrs = Self::get_pending_addrs_by_packets(
-                                        pending_packet_map,
-                                        &o.get().borrow().seen_packets[..],
-                                    );
-                                    let first_addr = addrs[0];
-                                    eprintln!("handle_new_remote creating group first_addr {} addrs.len {}", first_addr.to_string(), addrs.len());
-                                    // create new group
-                                    let local_info = local_info_f();
-                                    self.addr_map.insert(
-                                        first_addr,
-                                        Rc::new(RefCell::new(WarmGroup {
-                                            last_recv_time: Some(*now),
-                                            name: local_info.name,
-                                            remotes: addrs
-                                                .iter()
-                                                .map(|a| WarmRemote {
-                                                    addr: *a,
-                                                    last_recv_time: Some(*now),
-                                                })
-                                                .collect(),
-                                        })),
-                                    );
-                                    {
-                                        let mut hot_state_ltr = self.hot_state_ltr.write().unwrap();
-                                        hot_state_ltr.add(&first_addr);
-                                        addrs[1..]
-                                            .iter()
-                                            .for_each(|a| hot_state_ltr.alias(a, &first_addr));
-                                    }
-                                    {
-                                        let mut hot_state_rtl = self.hot_state_rtl.write().unwrap();
-                                        hot_state_rtl.add(&first_addr, local_info.sock);
-                                        addrs[1..]
-                                            .iter()
-                                            .for_each(|a| hot_state_rtl.alias(a, &first_addr));
-                                    }
-                                    self.cleanup_pending_remote(&first_addr);
-                                } else {
-                                    // register pending packet
-                                    o.get()
-                                        .borrow_mut()
-                                        .seen_packets
-                                        .push(Packet { content_hash });
-                                }
-                            }
-                            Entry::Vacant(v) => {
-                                // create pending entry
-                                let pending_value = Rc::new(RefCell::new(WarmPendingRemote {
-                                    addr: *addr,
-                                    first_recv_time: *now,
-                                    seen_packets: vec![Packet { content_hash }],
-                                }));
-                                v.insert(pending_value.clone());
-                                self.pending_packet_map
-                                    .entry(Packet { content_hash })
-                                    .or_default()
-                                    .push(pending_value.clone());
-                                eprintln!("handle_new_remote made pending entry {} {} packet remotes len {}", *addr, content_hash, self.pending_packet_map.get(&Packet{ content_hash}).unwrap().len());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     pub fn handle_known_packet(
         self: &mut Self,
         config: &WarmConfig,
@@ -503,6 +387,122 @@ impl WarmState {
         // clean up pending entries for anyone we added
         for addr in added_addrs.iter() {
             self.cleanup_pending_remote(addr);
+        }
+    }
+
+    pub fn handle_new_remote<F>(
+        self: &mut Self,
+        config: &WarmConfig,
+        local_info_f: F,
+        now: &Instant,
+        addr: &SocketAddr,
+        content_hash: u64,
+    ) where
+        F: FnOnce() -> LocalInfo,
+    {
+        let existing_group = self.addr_map.get(addr);
+        match existing_group {
+            Some(_) => {
+                // do nothing if already added, other than ensure pending is clean
+                self.cleanup_pending_remote(addr);
+            }
+            None => {
+                // otherwise look for matching packet
+                let matching_group = self.packet_map.get(&Packet { content_hash });
+                match matching_group {
+                    Some(g) => {
+                        {
+                            let mut g_mut = g.borrow_mut();
+                            // add to existing group
+                            g_mut.remotes.push(WarmRemote {
+                                addr: *addr,
+                                last_recv_time: Some(*now),
+                            });
+                            self.addr_map.insert(*addr, g.clone());
+                            self.hot_state_ltr
+                                .write()
+                                .unwrap()
+                                .alias(addr, &g_mut.remotes[0].addr); // we will never have an empty group
+                        }
+                        self.cleanup_pending_remote(addr);
+                    }
+                    None => {
+                        // otherwise look for pending remote
+                        let Self {
+                            ref mut pending_addr_map,
+                            ref pending_packet_map,
+                            ..
+                        } = self;
+                        let pending_entry = pending_addr_map.entry(*addr);
+                        match pending_entry {
+                            Entry::Occupied(o) => {
+                                // check if enough time passed without a match
+                                let first_recv_time = o.get().borrow().first_recv_time;
+                                if *now - first_recv_time > config.match_window {
+                                    // gather all remotes with relevant packet hashes
+                                    let addrs = Self::get_pending_addrs_by_packets(
+                                        pending_packet_map,
+                                        &o.get().borrow().seen_packets[..],
+                                    );
+                                    let first_addr = addrs[0];
+                                    eprintln!("handle_new_remote creating group first_addr {} addrs.len {}", first_addr.to_string(), addrs.len());
+                                    // create new group
+                                    let local_info = local_info_f();
+                                    self.addr_map.insert(
+                                        first_addr,
+                                        Rc::new(RefCell::new(WarmGroup {
+                                            last_recv_time: Some(*now),
+                                            name: local_info.name,
+                                            remotes: addrs
+                                                .iter()
+                                                .map(|a| WarmRemote {
+                                                    addr: *a,
+                                                    last_recv_time: Some(*now),
+                                                })
+                                                .collect(),
+                                        })),
+                                    );
+                                    {
+                                        let mut hot_state_ltr = self.hot_state_ltr.write().unwrap();
+                                        hot_state_ltr.add(&first_addr);
+                                        addrs[1..]
+                                            .iter()
+                                            .for_each(|a| hot_state_ltr.alias(a, &first_addr));
+                                    }
+                                    {
+                                        let mut hot_state_rtl = self.hot_state_rtl.write().unwrap();
+                                        hot_state_rtl.add(&first_addr, local_info.sock);
+                                        addrs[1..]
+                                            .iter()
+                                            .for_each(|a| hot_state_rtl.alias(a, &first_addr));
+                                    }
+                                    addrs.iter().for_each(|a| self.cleanup_pending_remote(a));
+                                } else {
+                                    // register pending packet
+                                    o.get()
+                                        .borrow_mut()
+                                        .seen_packets
+                                        .push(Packet { content_hash });
+                                }
+                            }
+                            Entry::Vacant(v) => {
+                                // create pending entry
+                                let pending_value = Rc::new(RefCell::new(WarmPendingRemote {
+                                    addr: *addr,
+                                    first_recv_time: *now,
+                                    seen_packets: vec![Packet { content_hash }],
+                                }));
+                                v.insert(pending_value.clone());
+                                self.pending_packet_map
+                                    .entry(Packet { content_hash })
+                                    .or_default()
+                                    .push(pending_value.clone());
+                                eprintln!("handle_new_remote made pending entry {} {} packet remotes len {}", *addr, content_hash, self.pending_packet_map.get(&Packet{ content_hash}).unwrap().len());
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
