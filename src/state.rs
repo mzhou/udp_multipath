@@ -383,10 +383,15 @@ impl WarmState {
                     }
                 }
             }
+        } else {
+            eprintln!(
+                "handle_known_packet couldn't find group for {}",
+                addr.to_string()
+            );
         }
         // clean up pending entries for anyone we added
-        for addr in added_addrs.iter() {
-            self.cleanup_pending_remote(addr);
+        for a in added_addrs.iter() {
+            self.cleanup_pending_remote(a);
         }
     }
 
@@ -448,20 +453,20 @@ impl WarmState {
                                     eprintln!("handle_new_remote creating group first_addr {} addrs.len {}", first_addr.to_string(), addrs.len());
                                     // create new group
                                     let local_info = local_info_f();
-                                    self.addr_map.insert(
-                                        first_addr,
-                                        Rc::new(RefCell::new(WarmGroup {
-                                            last_recv_time: Some(*now),
-                                            name: local_info.name,
-                                            remotes: addrs
-                                                .iter()
-                                                .map(|a| WarmRemote {
-                                                    addr: *a,
-                                                    last_recv_time: Some(*now),
-                                                })
-                                                .collect(),
-                                        })),
-                                    );
+                                    let group_rc = Rc::new(RefCell::new(WarmGroup {
+                                        last_recv_time: Some(*now),
+                                        name: local_info.name,
+                                        remotes: addrs
+                                            .iter()
+                                            .map(|a| WarmRemote {
+                                                addr: *a,
+                                                last_recv_time: Some(*now),
+                                            })
+                                            .collect(),
+                                    }));
+                                    addrs.iter().for_each(|a| {
+                                        self.addr_map.insert(*a, group_rc.clone());
+                                    });
                                     {
                                         let mut hot_state_ltr = self.hot_state_ltr.write().unwrap();
                                         hot_state_ltr.add(&first_addr);
