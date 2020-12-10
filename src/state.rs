@@ -302,6 +302,7 @@ impl WarmState {
         content_hash: u64,
     ) {
         let mut added_addrs = Vec::<SocketAddr>::new();
+        let mut expired_addrs = Vec::<SocketAddr>::new();
         if let Some(mut group) = self.addr_map.get(addr).map(|g| g.borrow_mut()) {
             let name = group.name.clone();
             // update group summary
@@ -313,7 +314,6 @@ impl WarmState {
                 group.last_recv_time = Some(*now);
             }
             // update and expire remotes
-            let mut expired_addrs = Vec::<SocketAddr>::new();
             assert!(!group.remotes.is_empty());
             // true means remove, false means keep
             group.remotes.drain_filter(|r| {
@@ -392,6 +392,10 @@ impl WarmState {
         // clean up pending entries for anyone we added
         for a in added_addrs.iter() {
             self.cleanup_pending_remote(a);
+        }
+        // clean up references to deleted remotes
+        for a in expired_addrs.iter() {
+            self.addr_map.remove(&a);
         }
     }
 
