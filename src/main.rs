@@ -167,6 +167,7 @@ fn remote_recv_loop(
 struct WarmLoopConfig {
     local_connect: Option<SocketAddr>,
     queue: Receiver<WarmReq>,
+    remote_sock: Arc<UdpSocket>,
     state: state::WarmState,
 }
 
@@ -174,7 +175,7 @@ fn warm_loop(mut config: WarmLoopConfig) -> Result<(), Box<dyn std::error::Error
     let sa_any = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0);
     let warm_config = state::WarmConfig {
         expiry: Duration::from_secs(60),
-        match_window: Duration::from_secs(10),
+        match_window: Duration::from_secs(5),
     };
     let mut last_dump_time = Instant::now();
     loop {
@@ -194,10 +195,12 @@ fn warm_loop(mut config: WarmLoopConfig) -> Result<(), Box<dyn std::error::Error
                     }
                     UnknownSource(req) => {
                         if let Some(local_connect) = config.local_connect {
+                            let mut new_local_sock = Option::<Arc<UdpSocket>>::None;
                             let local_info_f = || {
                                 let sock = Arc::new(ds_bind(sa_any).unwrap());
                                 sock.connect(local_connect).unwrap();
                                 let name = sock.local_addr().unwrap().to_string();
+                                new_local_sock = Some(sock.clone());
                                 state::LocalInfo { name, sock }
                             };
                             config.state.handle_new_remote(
@@ -207,6 +210,24 @@ fn warm_loop(mut config: WarmLoopConfig) -> Result<(), Box<dyn std::error::Error
                                 &req.remote_addr,
                                 req.content_hash,
                             );
+                            if let Some(local_sock) = new_local_sock {
+                                let local_recv_loop_config = LocalRecvLoopConfig {
+                                    local_connect: Some(local_connect),
+                                    local_sock,
+                                    remote_sock: config.remote_sock.clone(),
+                                };
+                                let hot_state_ltr_ref = config.state.get_hot_state_ltr();
+                                let hot_state_ltr = hot_state_ltr_ref.read().unwrap();
+                                if let Some(group) = hot_state_ltr.lookup(&req.remote_addr) {
+                                    // TODO: track thread
+                                    let group_clone = group.clone();
+                                    thread::spawn(move || {
+                                        local_recv_loop(local_recv_loop_config, group_clone)
+                                    });
+                                } else {
+                                    eprintln!("group was gone as soon as we created it :o");
+                                }
+                            }
                         }
                     }
                 }
@@ -348,7 +369,7 @@ fn main() -> Result<(), MainError> {
 
     let remote_recv_loop_thread = {
         let config = RemoteRecvLoopConfig {
-            remote_sock,
+            remote_sock: remote_sock.clone(),
             warm_queue: warm_queue_sender,
         };
         let hot_state_rtl = state.get_hot_state_rtl().clone();
@@ -360,6 +381,7 @@ fn main() -> Result<(), MainError> {
         let config = WarmLoopConfig {
             local_connect,
             queue: warm_queue_receiver,
+            remote_sock: remote_sock.clone(),
             state,
         };
         let warm_loop_result = warm_loop(config);
@@ -374,34 +396,6 @@ fn main() -> Result<(), MainError> {
     }
 
     eprintln!("all threads joined");
-
-    /*
-    let local_sock = Arc::new(
-        UdpSocket::bind(local_bind)
-            .await
-            .map_err(MainError::LocalBind)?,
-    );
-
-    let remote_recv_loop_config = RemoteRecvLoopConfig {
-        remote_sock: remote_sock.clone(),
-    };
-
-    let state = Arc::new(RwLock::new(State::new()));
-
-    let local_recv_loop_task = tokio::spawn(local_recv_loop(local_recv_loop_config, state.clone()));
-    let remote_recv_loop_task =
-        tokio::spawn(remote_recv_loop(remote_recv_loop_config, state.clone()));
-
-    //eprintln!("main await");
-    remote_recv_loop_task
-        .await
-        .map_err(MainError::TaskJoin)?
-        .map_err(MainError::RemoteRecvLoop)?;
-    local_recv_loop_task
-        .await
-        .map_err(MainError::TaskJoin)?
-        .map_err(MainError::LocalRecvLoop)?;
-        */
 
     Ok(())
 }

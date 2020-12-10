@@ -144,7 +144,7 @@ impl HotStateLtr {
         }
     }
 
-    pub fn lookup(self: &Self, addr: &SocketAddr) -> Option<&HotGroupLtrRef> {
+    pub fn lookup<'a>(self: &'a Self, addr: &SocketAddr) -> Option<&'a HotGroupLtrRef> {
         self.addr_map.get(addr)
     }
 }
