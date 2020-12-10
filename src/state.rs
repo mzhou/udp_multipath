@@ -168,7 +168,18 @@ impl HotStateRtl {
     pub fn alias(self: &mut Self, addr: &SocketAddr, existing_addr: &SocketAddr) {
         let get_result = self.addr_map.get(existing_addr).map(|v| v.clone());
         if let Some(group_arc) = get_result {
+            eprintln!(
+                "HotStateRtl::alias linked {} to existing {}",
+                addr.to_string(),
+                existing_addr.to_string()
+            );
             self.addr_map.insert(*addr, group_arc);
+        } else {
+            eprintln!(
+                "HotStateRtl::alias couldn't link {} to existing {}",
+                addr.to_string(),
+                existing_addr.to_string()
+            );
         }
     }
 
@@ -338,6 +349,7 @@ impl WarmState {
                                         &o.get().borrow().seen_packets[..],
                                     );
                                     let first_addr = addrs[0];
+                                    eprintln!("handle_new_remote creating group first_addr {} addrs.len {}", first_addr.to_string(), addrs.len());
                                     // create new group
                                     let local_info = local_info_f();
                                     self.addr_map.insert(
@@ -347,8 +359,8 @@ impl WarmState {
                                             name: local_info.name,
                                             remotes: addrs
                                                 .iter()
-                                                .map(|addr| WarmRemote {
-                                                    addr: *addr,
+                                                .map(|a| WarmRemote {
+                                                    addr: *a,
                                                     last_recv_time: Some(*now),
                                                 })
                                                 .collect(),
@@ -363,7 +375,7 @@ impl WarmState {
                                     }
                                     {
                                         let mut hot_state_rtl = self.hot_state_rtl.write().unwrap();
-                                        hot_state_rtl.add(addr, local_info.sock);
+                                        hot_state_rtl.add(&first_addr, local_info.sock);
                                         addrs[1..]
                                             .iter()
                                             .for_each(|a| hot_state_rtl.alias(a, &first_addr));
@@ -407,14 +419,18 @@ impl WarmState {
     ) {
         let mut added_addrs = Vec::<SocketAddr>::new();
         if let Some(mut group) = self.addr_map.get(addr).map(|g| g.borrow_mut()) {
+            let name = group.name.clone();
             // update group summary
             if group.last_recv_time != None {
+                eprintln!(
+                    "handle_known_packet setting {} last_recv_time to {:?}",
+                    name, now
+                );
                 group.last_recv_time = Some(*now);
             }
             // update and expire remotes
             let mut expired_addrs = Vec::<SocketAddr>::new();
             assert!(!group.remotes.is_empty());
-            let name = group.name.clone();
             // true means remove, false means keep
             group.remotes.drain_filter(|r| {
                 match r.last_recv_time {
@@ -426,6 +442,12 @@ impl WarmState {
                         // update if this is the one in question
                         if r.addr == *addr {
                             r.last_recv_time = Some(*now);
+                            eprintln!(
+                                "handle_known_packet setting {} {} last_recv_time to {:?}",
+                                name,
+                                addr.to_string(),
+                                now
+                            );
                             false
                         } else if *now > old_last_recv_time + config.expiry {
                             // otherwise expire

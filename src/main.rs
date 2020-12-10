@@ -130,25 +130,26 @@ fn remote_recv_loop(
                     send_result_opt = Some(group_lock.get_local_sock().send(data));
                 }
             }
-            if let Some(r) = send_result_opt {
-                // was fresh
-                let warm_queue_result = c.warm_queue.try_send(
-                    WarmReqFreshPacket {
-                        content_hash: data_hash,
-                        now,
-                        remote_addr: addr,
-                    }
-                    .into(),
-                );
-                if let Err(e) = r {
-                    eprintln!("remote_recv_loop send fail {}", e);
+            if let Some(Err(e)) = send_result_opt {
+                eprintln!("remote_recv_loop send fail {}", e);
+            }
+            let warm_queue_result = c.warm_queue.try_send(
+                WarmReqKnownPacket {
+                    content_hash: data_hash,
+                    now,
+                    remote_addr: addr,
                 }
-                if let Err(e) = warm_queue_result {
-                    eprintln!("remote_recv_loop warm queue fail {}", e);
-                }
+                .into(),
+            );
+            if let Err(e) = warm_queue_result {
+                eprintln!("remote_recv_loop warm queue fail {}", e);
             }
         } else {
-            eprintln!("remote_recv_loop no group");
+            eprintln!(
+                "remote_recv_loop no group {} {}",
+                addr.to_string(),
+                data_hash
+            );
             let warm_queue_result = c.warm_queue.try_send(
                 WarmReqUnknownSource {
                     content_hash: data_hash,
@@ -185,7 +186,7 @@ fn warm_loop(mut config: WarmLoopConfig) -> Result<(), Box<dyn std::error::Error
             Ok(req_enum) => {
                 use WarmReq::*;
                 match req_enum {
-                    FreshPacket(req) => {
+                    KnownPacket(req) => {
                         config.state.handle_known_packet(
                             &warm_config,
                             &req.now,
@@ -248,11 +249,11 @@ fn warm_loop(mut config: WarmLoopConfig) -> Result<(), Box<dyn std::error::Error
 }
 
 enum WarmReq {
-    FreshPacket(WarmReqFreshPacket),
+    KnownPacket(WarmReqKnownPacket),
     UnknownSource(WarmReqUnknownSource),
 }
 
-struct WarmReqFreshPacket {
+struct WarmReqKnownPacket {
     now: Instant,
     content_hash: u64,
     remote_addr: SocketAddr,
@@ -264,9 +265,9 @@ struct WarmReqUnknownSource {
     remote_addr: SocketAddr,
 }
 
-impl From<WarmReqFreshPacket> for WarmReq {
-    fn from(a: WarmReqFreshPacket) -> Self {
-        Self::FreshPacket(a)
+impl From<WarmReqKnownPacket> for WarmReq {
+    fn from(a: WarmReqKnownPacket) -> Self {
+        Self::KnownPacket(a)
     }
 }
 
