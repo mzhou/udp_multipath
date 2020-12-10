@@ -1,11 +1,13 @@
+#![feature(drain_filter)]
+
 mod state;
 
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::hash::Hasher;
 use std::io;
-use std::net::{AddrParseError, IpAddr, Ipv6Addr, SocketAddr, UdpSocket};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::net::{AddrParseError, Ipv6Addr, SocketAddr, UdpSocket};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -24,11 +26,9 @@ enum MainError {
     ArgLocalConnect(AddrParseError),
     ArgRemoteBind(AddrParseError),
     ArgRemoteConnect(AddrParseError),
+    LocalAddr(io::Error),
     LocalBind(io::Error),
-    LocalRecvLoop(io::Error),
     RemoteBind(io::Error),
-    RemoteRecvLoop(io::Error),
-    TaskJoin(Box<dyn std::any::Any + Send + 'static>),
 }
 
 impl fmt::Display for MainError {
@@ -42,11 +42,9 @@ impl fmt::Display for MainError {
                 ArgLocalConnect(e) => format!("local-connect invalid: {}", e),
                 ArgRemoteBind(e) => format!("remote-bind invalid: {}", e),
                 ArgRemoteConnect(e) => format!("remote-connect invalid: {}", e),
+                LocalAddr(e) => format!("bind local addr: {}", e),
                 LocalBind(e) => format!("bind local socket: {}", e),
-                LocalRecvLoop(e) => format!("local recv loop: {}", e),
                 RemoteBind(e) => format!("bind remote socket: {}", e),
-                RemoteRecvLoop(e) => format!("remote recv loop: {}", e),
-                TaskJoin(e) => format!("task join: {:?}", e),
             }
         )
     }
@@ -84,7 +82,6 @@ fn local_recv_loop(
         //eprintln!("local_recv_loop before recv_from");
         let (len, addr) = c.local_sock.recv_from(&mut buf)?;
         //eprintln!("local_recv_loop done recv_from {} {}", len, addr);
-        let now = Instant::now();
         let data = &buf[..len];
 
         // reconnect local socket if necessary
@@ -173,29 +170,54 @@ struct WarmLoopConfig {
 }
 
 fn warm_loop(mut config: WarmLoopConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let SA_ANY = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0);
+    let sa_any = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0);
+    let warm_config = state::WarmConfig {
+        expiry: Duration::from_secs(60),
+        match_window: Duration::from_secs(10),
+    };
+    let mut last_dump_time = Instant::now();
     loop {
-        let req_enum = config.queue.recv()?;
-        use WarmReq::*;
-        match req_enum {
-            FreshPacket(req) => {
-                config
-                    .state
-                    .handle_known_packet(&req.now, &req.remote_addr, req.content_hash);
+        let req_enum_opt = config.queue.recv_timeout(Duration::from_secs(5));
+        let now = Instant::now();
+        match req_enum_opt {
+            Ok(req_enum) => {
+                use WarmReq::*;
+                match req_enum {
+                    FreshPacket(req) => {
+                        config.state.handle_known_packet(
+                            &warm_config,
+                            &req.now,
+                            &req.remote_addr,
+                            req.content_hash,
+                        );
+                    }
+                    UnknownSource(req) => {
+                        let local_info_f = || {
+                            let sock = Arc::new(ds_bind(sa_any).unwrap());
+                            let name = sock.local_addr().unwrap().to_string();
+                            state::LocalInfo { name, sock }
+                        };
+                        config.state.handle_new_remote(
+                            &warm_config,
+                            local_info_f,
+                            &req.now,
+                            &req.remote_addr,
+                            req.content_hash,
+                        );
+                    }
+                }
             }
-            UnknownSource(req) => {
-                let warm_config = state::WarmConfig {
-                    match_window: Duration::from_secs(10),
-                };
-                let local_sock_f = || Arc::new(ds_bind(SA_ANY).unwrap());
-                config.state.handle_new_remote(
-                    &warm_config,
-                    local_sock_f,
-                    &req.now,
-                    &req.remote_addr,
-                    req.content_hash,
-                );
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(RecvTimeoutError::Disconnected.into());
             }
+        }
+        if now - last_dump_time > Duration::from_secs(5) {
+            println!(
+                "=begin warm state\n{}\n=end warm state",
+                config.state.dump_groupus()
+            );
+            last_dump_time = now;
         }
     }
 }
@@ -301,12 +323,13 @@ fn main() -> Result<(), MainError> {
 
     if !remote_connect.is_empty() {
         let sock = Arc::new(ds_bind(local_bind).map_err(MainError::LocalBind)?);
+        let name = sock.local_addr().map_err(MainError::LocalAddr)?.to_string();
         let config = LocalRecvLoopConfig {
             local_connect,
             local_sock: sock.clone(),
             remote_sock: remote_sock.clone(),
         };
-        state.add_static_group(sock.clone(), &remote_connect);
+        state.add_static_group(state::LocalInfo { name, sock }, &remote_connect);
         let group = state
             .get_hot_state_ltr()
             .read()
