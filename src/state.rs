@@ -53,7 +53,7 @@ struct Packet {
 }
 
 pub struct WarmConfig {
-    match_window: Duration,
+    pub match_window: Duration,
 }
 
 struct WarmGroup {
@@ -212,8 +212,17 @@ impl WarmState {
                 })
                 .collect(),
         }));
+        let mut is_first = true;
         for addr in remote_addrs.iter() {
             self.addr_map.insert(*addr, group.clone());
+            if is_first {
+                self.hot_state_ltr.write().unwrap().add(addr);
+                self.hot_state_rtl.write().unwrap().add(addr, local_sock.clone());
+            } else {
+                self.hot_state_ltr.write().unwrap().alias(addr, &remote_addrs[0]);
+                self.hot_state_rtl.write().unwrap().alias(addr, &remote_addrs[0]);
+            }
+            is_first = false;
         }
     }
 

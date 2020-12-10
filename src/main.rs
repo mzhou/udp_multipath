@@ -67,19 +67,23 @@ struct LocalRecvLoopConfig {
 fn local_recv_loop(
     c: LocalRecvLoopConfig,
     group: Arc<Mutex<state::HotGroupLtr>>,
-) -> Result<(), io::Error> {
+) -> io::Result<()> {
     let mut local_connected = match c.local_connect {
         Some(addr) => {
-            c.local_sock.connect(addr);
+            c.local_sock.connect(addr)?;
+            eprintln!("local_recv_loop done initial connect");
             Some(addr)
         }
         _ => None,
     };
     let local_bind = c.local_sock.local_addr()?;
+    eprintln!("local_recv_loop done local_addr");
 
     loop {
         let mut buf = [0u8; 16 * 1024];
+        eprintln!("local_recv_loop before recv_from");
         let (len, addr) = c.local_sock.recv_from(&mut buf)?;
+        eprintln!("local_recv_loop done recv_from");
         let now = Instant::now();
         //eprintln!("local_recv_loop got datagram {} {}", len, addr);
         let data = &buf[..len];
@@ -107,19 +111,21 @@ struct RemoteRecvLoopConfig {
     warm_queue: SyncSender<WarmReq>,
 }
 
-async fn remote_recv_loop(
+fn remote_recv_loop(
     c: RemoteRecvLoopConfig,
     state: Arc<RwLock<state::HotStateRtl>>,
-) -> Result<(), io::Error> {
+) -> io::Result<()> {
     loop {
         let mut buf = [0u8; 16 * 1024];
+        eprintln!("remote_recv_loop before recv_from");
         let (len, addr) = c.remote_sock.recv_from(&mut buf)?;
+        eprintln!("remote_recv_loop done recv_from {} {}", len, addr);
         let now = Instant::now();
-        //eprintln!("remote_recv_loop got datagram {} {}", len, addr);
         let data = &buf[..len];
         let data_hash = hash_bytes(data);
 
         if let Some(group) = state.read().unwrap().lookup(&addr) {
+            eprintln!("remote_recv_loop existing group");
             let mut send_result_opt: Option<io::Result<usize>> = None;
             {
                 let mut group_lock = group.lock().unwrap();
@@ -146,6 +152,7 @@ async fn remote_recv_loop(
                 }
             }
         } else {
+            eprintln!("remote_recv_loop no group");
             let warm_queue_result = c.warm_queue.try_send(
                 WarmReqUnknownSource {
                     content_hash: data_hash,
@@ -157,6 +164,31 @@ async fn remote_recv_loop(
             if let Err(e) = warm_queue_result {
                 eprintln!("remote_recv_loop warm queue fail {}", e);
             }
+        }
+    }
+}
+
+struct WarmLoopConfig {
+    queue: Receiver<WarmReq>,
+    state: state::WarmState,
+}
+
+fn warm_loop(mut config: WarmLoopConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let SA_ANY = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0);
+    loop {
+        let req_enum = config.queue.recv()?;
+        use WarmReq::*;
+        match req_enum {
+            FreshPacket(req) => {
+                config.state.handle_known_packet(&req.now, &req.remote_addr, req.content_hash);
+            },
+            UnknownSource(req) => {
+                let warm_config = state::WarmConfig{
+                    match_window: Duration::from_secs(10),
+                };
+                let local_sock_f = || Arc::new(ds_bind(SA_ANY).unwrap());
+                config.state.handle_new_remote(&warm_config, local_sock_f, &req.now, &req.remote_addr, req.content_hash);
+            },
         }
     }
 }
@@ -190,86 +222,9 @@ impl From<WarmReqUnknownSource> for WarmReq {
     }
 }
 
-/*
-struct GroupRecvLoopConfig {
-    remote_idle_expiry: Duration,
-    remote_sock: Arc<UdpSocket>,
-}
-
-async fn group_recv_loop(
-    c: GroupRecvLoopConfig,
-    state: Arc<RwLock<State>>,
-    group: Arc<RwLock<Group>>,
-) -> Result<(), io::Error> {
-    let local_bind = group.read().unwrap().local_bind;
-    let local_sock = group.read().unwrap().local_sock.clone();
-
-    //eprintln!("group_recv_loop spawned for {}", local_bind);
-
-    loop {
-        let mut buf = [0u8; 16 * 1024];
-        let (len, addr) = local_sock.recv_from(&mut buf).await?;
-        let now = Instant::now();
-        //eprintln!("group_recv_loop got datagram {} {}", len, addr);
-        let data = &buf[..len];
-
-        let mut need_cleanup = false;
-
-        let mut cleanup_remote_addrs = Vec::<SocketAddr>::new();
-        let remotes = group.read().unwrap().remotes.clone();
-        //eprintln!("group_recv_loop forwarding to {} remotes", remotes.len());
-        for remote in remotes.iter() {
-            if now - remote.last_recv_time >= c.remote_idle_expiry {
-                cleanup_remote_addrs.push(remote.addr);
-                continue;
-            }
-            if let Err(e) = c.remote_sock.send_to(data, remote.addr).await {
-                println!("RemoteSendToErr,{},{},{}", local_bind, remote.addr, e);
-                cleanup_remote_addrs.push(remote.addr);
-                continue;
-            }
-        }
-
-        if !cleanup_remote_addrs.is_empty() {
-            let mut group_write = group.write().unwrap();
-            let mut old_remotes = Vec::<Remote>::new();
-            std::mem::swap(&mut old_remotes, &mut group_write.remotes);
-            group_write.remotes = old_remotes
-                .iter()
-                .filter(|r| {
-                    now - r.last_recv_time < c.remote_idle_expiry
-                        && !cleanup_remote_addrs.contains(&r.addr)
-                })
-                .map(|r| *r)
-                .collect();
-            if group_write.remotes.is_empty() {
-                // remove references from state
-                let mut state_write = state.write().unwrap();
-                for remote in old_remotes.iter() {
-                    state_write.addr_map.remove(&remote.addr);
-                }
-                for packet in group_write.recent_recv.iter() {
-                    state_write.packet_map.remove(&packet);
-                }
-                println!(
-                    "RemoveGroup,{},{},{}",
-                    local_bind,
-                    old_remotes.len(),
-                    group_write.recent_recv.len()
-                );
-                break;
-            }
-        }
-    }
-
-    Ok(())
-}
-*/
-
 fn ds_bind(addr: SocketAddr) -> io::Result<UdpSocket> {
     let s2 = socket2::Socket::new(socket2::Domain::ipv6(), socket2::Type::dgram(), None)?;
     s2.set_only_v6(false)?;
-    s2.set_nonblocking(true)?;
     s2.bind(&socket2::SockAddr::from(addr))?;
     let s_std: std::net::UdpSocket = s2.into_udp_socket();
     Ok(s_std)
@@ -363,8 +318,26 @@ fn main() -> Result<(), MainError> {
             warm_queue: warm_queue_sender,
         };
         let hot_state_rtl = state.get_hot_state_rtl().clone();
-        thread::spawn(|| remote_recv_loop(config, hot_state_rtl));
+        thread::spawn(|| remote_recv_loop(config, hot_state_rtl))
     };
+
+    // run background task on main thread
+    {
+        let config = WarmLoopConfig {
+            queue: warm_queue_receiver,
+            state,
+        };
+        warm_loop(config);
+    }
+
+    let remote_recv_loop_result = remote_recv_loop_thread.join();
+    eprintln!("remote_recv_loop_result {:?}", remote_recv_loop_result);
+    if let Some(local_recv_loop_thread) = local_recv_loop_thread {
+        let local_recv_loop_result = local_recv_loop_thread.join();
+        eprintln!("local_recv_loop_result {:?}", local_recv_loop_result);
+    }
+
+    eprintln!("all threads joined");
 
     /*
     let local_sock = Arc::new(
