@@ -379,6 +379,7 @@ impl WarmState {
             }
             // update and expire remotes
             let mut expired_addrs = Vec::<SocketAddr>::new();
+            assert!(!group.remotes.is_empty());
             group.remotes.drain_filter(|r| {
                 match r.last_recv_time {
                     None => {
@@ -389,9 +390,8 @@ impl WarmState {
                         // update if this is the one in question
                         if r.addr == *addr {
                             r.last_recv_time = Some(*now);
-                        }
-                        // check if we should expire
-                        if *now > old_last_recv_time + config.expiry {
+                            true
+                        } else if *now > old_last_recv_time + config.expiry { // otherwise expire
                             // note to update hot state
                             expired_addrs.push(r.addr);
                             false
@@ -402,6 +402,7 @@ impl WarmState {
                     }
                 }
             });
+            assert!(!group.remotes.is_empty());
             // check if there's any pending we can drag into the group based on content hash
             if let Some(potential_remotes) = self.pending_packet_map.get(&Packet { content_hash }) {
                 for remote in potential_remotes.iter().map(|r| r.borrow()) {
