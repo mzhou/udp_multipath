@@ -81,11 +81,10 @@ fn local_recv_loop(
 
     loop {
         let mut buf = [0u8; 16 * 1024];
-        eprintln!("local_recv_loop before recv_from");
+        //eprintln!("local_recv_loop before recv_from");
         let (len, addr) = c.local_sock.recv_from(&mut buf)?;
-        eprintln!("local_recv_loop done recv_from");
+        //eprintln!("local_recv_loop done recv_from {} {}", len, addr);
         let now = Instant::now();
-        //eprintln!("local_recv_loop got datagram {} {}", len, addr);
         let data = &buf[..len];
 
         // reconnect local socket if necessary
@@ -117,15 +116,15 @@ fn remote_recv_loop(
 ) -> io::Result<()> {
     loop {
         let mut buf = [0u8; 16 * 1024];
-        eprintln!("remote_recv_loop before recv_from");
+        //eprintln!("remote_recv_loop before recv_from");
         let (len, addr) = c.remote_sock.recv_from(&mut buf)?;
-        eprintln!("remote_recv_loop done recv_from {} {}", len, addr);
+        //eprintln!("remote_recv_loop done recv_from {} {}", len, addr);
         let now = Instant::now();
         let data = &buf[..len];
         let data_hash = hash_bytes(data);
 
         if let Some(group) = state.read().unwrap().lookup(&addr) {
-            eprintln!("remote_recv_loop existing group");
+            //eprintln!("remote_recv_loop existing group");
             let mut send_result_opt: Option<io::Result<usize>> = None;
             {
                 let mut group_lock = group.lock().unwrap();
