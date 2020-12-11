@@ -52,6 +52,14 @@ pub struct LocalInfo {
     pub sock: Arc<UdpSocket>,
 }
 
+struct MappedQueue<K, V>
+where
+    K: Clone + Eq + Hash,
+{
+    deque: VecDeque<K>,
+    map: HashMap<K, V>,
+}
+
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct Packet {
     content_hash: u64,
@@ -59,6 +67,7 @@ struct Packet {
 
 pub struct WarmConfig {
     pub expiry: Duration,
+    pub match_num_packets: usize,
     pub match_window: Duration,
 }
 
@@ -89,7 +98,7 @@ pub struct WarmState {
     addr_map: HashMap<SocketAddr, WarmGroupRef>,
     hot_state_ltr: HotStateLtrRef,
     hot_state_rtl: HotStateRtlRef,
-    packet_map: HashMap<Packet, WarmGroupRef>,
+    packet_map: MappedQueue<Packet, WarmGroupRef>,
     pending_addr_map: HashMap<SocketAddr, WarmPendingRemoteRef>,
     pending_packet_map: HashMap<Packet, Vec<WarmPendingRemoteRef>>,
 }
@@ -217,6 +226,36 @@ where
     }
 }
 
+impl<K, V> MappedQueue<K, V>
+where
+    K: Clone + Eq + Hash,
+{
+    /// @return true if newly added
+    pub fn insert(self: &mut Self, limit: usize, k: K, v: V) -> bool {
+        if self.deque.len() >= limit {
+            let popped = self.deque.pop_front().unwrap();
+            self.map.remove(&popped);
+        }
+        if self.map.contains_key(&k) {
+            return false;
+        }
+        self.map.insert(k.clone(), v);
+        self.deque.push_back(k);
+        true
+    }
+
+    pub fn get(self: &Self, k: &K) -> Option<&V> {
+        self.map.get(k)
+    }
+
+    pub fn new() -> Self {
+        Self {
+            deque: VecDeque::new(),
+            map: HashMap::new(),
+        }
+    }
+}
+
 impl WarmState {
     pub fn add_static_group(self: &mut Self, local_info: LocalInfo, remote_addrs: &[SocketAddr]) {
         let group = Rc::new(RefCell::new(WarmGroup {
@@ -303,7 +342,8 @@ impl WarmState {
     ) {
         let mut added_addrs = Vec::<SocketAddr>::new();
         let mut expired_addrs = Vec::<SocketAddr>::new();
-        if let Some(mut group) = self.addr_map.get(addr).map(|g| g.borrow_mut()) {
+        if let Some(group_rc) = self.addr_map.get(addr) {
+            let mut group = group_rc.borrow_mut();
             let name = group.name.clone();
             // update group summary
             if group.last_recv_time != None {
@@ -351,6 +391,12 @@ impl WarmState {
                 }
             });
             assert!(!group.remotes.is_empty());
+            // update packet map
+            self.packet_map.insert(
+                config.match_num_packets,
+                Packet { content_hash },
+                group_rc.clone(),
+            );
             // check if there's any pending we can drag into the group based on content hash
             if let Some(potential_remotes) = self.pending_packet_map.get(&Packet { content_hash }) {
                 for remote in potential_remotes.iter().map(|r| r.borrow()) {
@@ -520,7 +566,7 @@ impl WarmState {
             addr_map: HashMap::new(),
             hot_state_ltr: Arc::new(RwLock::new(HotStateLtr::new())),
             hot_state_rtl: Arc::new(RwLock::new(HotStateRtl::new())),
-            packet_map: HashMap::new(),
+            packet_map: MappedQueue::new(),
             pending_addr_map: HashMap::new(),
             pending_packet_map: HashMap::new(),
         }

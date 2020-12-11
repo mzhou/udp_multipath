@@ -180,6 +180,7 @@ fn warm_loop(mut config: WarmLoopConfig) -> Result<(), Box<dyn std::error::Error
     let sa_any = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0);
     let warm_config = state::WarmConfig {
         expiry: Duration::from_secs(10),
+        match_num_packets: 2048,
         match_window: Duration::from_secs(5),
     };
     let mut last_dump_time = Instant::now();
