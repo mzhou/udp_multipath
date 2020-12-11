@@ -347,10 +347,10 @@ impl WarmState {
             let name = group.name.clone();
             // update group summary
             if group.last_recv_time != None {
-                eprintln!(
-                    "handle_known_packet setting {} last_recv_time to {:?}",
-                    name, now
-                );
+                //eprintln!(
+                //    "handle_known_packet setting {} last_recv_time to {:?}",
+                //    name, now
+                //);
                 group.last_recv_time = Some(*now);
             }
             // update and expire remotes
@@ -366,12 +366,12 @@ impl WarmState {
                         // update if this is the one in question
                         if r.addr == *addr {
                             r.last_recv_time = Some(*now);
-                            eprintln!(
-                                "handle_known_packet setting {} {} last_recv_time to {:?}",
-                                name,
-                                addr.to_string(),
-                                now
-                            );
+                            //eprintln!(
+                            //    "handle_known_packet setting {} {} last_recv_time to {:?}",
+                            //    name,
+                            //    addr.to_string(),
+                            //    now
+                            //);
                             false
                         } else if *now > old_last_recv_time + config.expiry {
                             // otherwise expire

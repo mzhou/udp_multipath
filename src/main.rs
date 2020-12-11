@@ -121,11 +121,11 @@ fn remote_recv_loop(
         let data_hash = hash_bytes(data);
 
         if let Some(group) = state.read().unwrap().lookup(&addr) {
-            eprintln!(
-                "remote_recv_loop {} {} existing group",
-                addr.to_string(),
-                data_hash
-            );
+            //eprintln!(
+            //    "remote_recv_loop {} {} existing group",
+            //    addr.to_string(),
+            //    data_hash
+            //);
             let mut send_result_opt: Option<io::Result<usize>> = None;
             {
                 let mut group_lock = group.lock().unwrap();
