@@ -342,7 +342,7 @@ impl WarmState {
     ) {
         let mut added_addrs = Vec::<SocketAddr>::new();
         let mut expired_addrs = Vec::<SocketAddr>::new();
-        if let Some(group_rc) = self.addr_map.get(addr) {
+        if let Some(group_rc) = self.addr_map.get(addr).map(|g| g.clone()) {
             let mut group = group_rc.borrow_mut();
             let name = group.name.clone();
             // update group summary
@@ -404,6 +404,7 @@ impl WarmState {
                         addr: remote.addr,
                         last_recv_time: Some(*now),
                     });
+                    self.addr_map.insert(remote.addr, group_rc.clone());
                     added_addrs.push(remote.addr);
                 }
             }
